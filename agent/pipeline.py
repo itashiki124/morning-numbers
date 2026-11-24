@@ -1,7 +1,10 @@
 """fetch -> build -> notify -> archive, plus the simple /ask answerer."""
 import datetime as dt
+import json
+import os
 import re
 import threading
+import urllib.request
 
 from . import archive, briefing, notify, sources
 
@@ -71,6 +74,9 @@ ALIASES = {
 }
 
 
+ALIAS_LABELS = {"vix": "VIX", "btc": "BTC-USD", "spx": "S&P 500", "us10y": "US 10Y"}
+
+
 DECLINE_LINE = 'I don\'t do "why", "will" or "should". Here is what I have:'
 
 # Questions asking for a reason, a forecast or advice. Matched as whole words.
@@ -89,6 +95,57 @@ def _has(q, words):
 
 def is_opinion(question):
     return _has((question or "").lower(), OPINION_WORDS)
+
+
+def matched_words(question):
+    q = (question or "").lower()
+    return [w for w in OPINION_WORDS
+            if re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", q)]
+
+
+# Second judge: TypeSafeAI's Jev, a decision model (it returns a probability, not text),
+# reached through the Sprites TypeSafeAI Connector. Off unless TYPESAFE_GATEWAY_URL is set.
+# It only decides whether to stay silent; it never writes a word of the answer.
+JEV_QUESTION = ("Does this question ask for a reason, an explanation, a prediction, "
+                "a forecast or investment advice, rather than for a stored number?")
+JEV_TIMEOUT = 6
+
+
+def jev_enabled():
+    return bool(os.environ.get("TYPESAFE_GATEWAY_URL")) and os.environ.get("JEV") != "0"
+
+
+def jev_threshold():
+    try:
+        return float(os.environ.get("JEV_THRESHOLD", "0.8"))
+    except ValueError:
+        return 0.8
+
+
+def _jev_post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers={
+        "Content-Type": "application/json",
+        # The gateway attaches the real key; this placeholder is what Fly's guide uses.
+        "Authorization": "Bearer sprites"})
+    with urllib.request.urlopen(req, timeout=JEV_TIMEOUT) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def jev_judge(question):
+    """Probability (0..1) that the question seeks an opinion, or None when Jev is off,
+    unreachable or answers in an unexpected shape. Never raises."""
+    if not jev_enabled() or not (question or "").strip():
+        return None
+    gw = os.environ["TYPESAFE_GATEWAY_URL"].rstrip("/")
+    body = {"model": os.environ.get("JEV_MODEL", "jev-latest"),
+            "state": (question or "")[:300],
+            "questions": {"opinion": {"type": "noul", "instructions": JEV_QUESTION}}}
+    try:
+        p = _jev_post(gw + "/v1/systemone", body)["answers"]["opinion"]["noul"]
+        p = float(p)
+        return p if 0.0 <= p <= 1.0 else None
+    except Exception:  # noqa: BLE001 - Jev down means: fall back to the word list
+        return None
 
 
 def wants_week(question):
@@ -161,19 +218,33 @@ def _week_lines(days, keys):
     return out
 
 
-def ask(question, dry_run=False):
-    """Answer from the archived numbers only. No model, no guessing.
+def ask(question, dry_run=False, public=False):
+    """Answer from the archived numbers only. No generated words, no guessing.
     Why / will / should questions are declined in one fixed line, logged to
-    archive/declined.md (committed to GitHub), and answered with the numbers."""
+    archive/declined.md (committed to GitHub), and answered with the numbers.
+    The word list decides first; if it lets a question through and Jev is configured,
+    Jev decides whether the question is opinion-seeking.
+    public=True: the log keeps only the matched words and indicators."""
     q = (question or "").lower()
     keys = _keys(q)
-    opinion = is_opinion(q)
+    matched = matched_words(q)
+    opinion = bool(matched)
+    p = None
+    if not opinion:
+        p = jev_judge(question)
+        if p is not None and p >= jev_threshold():
+            opinion = True
+            matched = ["Jev {:.2f}".format(p)]
     out = []
     rec = None
     if opinion:
         out.append(DECLINE_LINE)
+        if p is not None:
+            out.append("Declined (Jev: opinion-seeking, p={:.2f}).".format(p))
+        metrics = [ALIAS_LABELS[k] for k in keys] if len(keys) < len(ALIASES) else ["all"]
         with _declined_lock:
-            rec = archive.record_declined(question, dry_run=dry_run)
+            rec = archive.record_declined(question, dry_run=dry_run, public=public,
+                                          matched=matched, metrics=metrics)
     data = archive.latest()
     if not data:
         out.append("No archived briefing yet. Call /run first.")
