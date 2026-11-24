@@ -19,8 +19,8 @@ Three facts about how it is built:
    is printed as fetched; the only arithmetic is % change (bp for the 10Y).
 2. **This repository was made by the Sprite.** It was created from inside the Sprite
    through the GitHub Connector (`POST /user/repos`), and every file here, code
-   included, was put there the same way (Contents API). Neither my Mac nor the
-   Sprite holds a git credential.
+   included, was put there the same way (Contents API). No `git push` was used: the
+   Sprite holds no git credential, and nothing was pushed from my Mac.
 3. **Narrow permission.** The connector holds a `public_repo` token only, and its access
    policy allows two paths: `/user/repos` and `/repos/itashiki124/morning-numbers/*`.
    Anything else (for example `GET /user/emails`) gets `403 endpoint is not in allowed list`.
