@@ -1,0 +1,8 @@
+Numbers-only market brief | 2026-11-24 (JST)
+US session: 11/23
+VIX           26.62  -25.83%  [11/23 vs 11/20]  Cboe-verified 11/20
+BTC-USD   61,189.97  +0.04%  [11/23 vs 11/22 UTC close]
+S&P 500    7,237.17  +4.73%  [11/23 vs 11/20]
+US 10Y        4.92%  +0 bp  [11/23 vs 11/20]
+Change vs the previous completed session; 10Y in bp. Sources: Yahoo ^VIX, checked against Cboe VIX_History.csv; Coinbase Exchange daily candles (UTC close); Yahoo Finance chart API (^GSPC, unofficial); U.S. Treasury daily par yield curve.
+Public data only. Not investment advice.
