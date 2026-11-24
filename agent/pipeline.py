@@ -1,5 +1,7 @@
 """fetch -> build -> notify -> archive, plus the simple /ask answerer."""
 import datetime as dt
+import re
+import threading
 
 from . import archive, briefing, notify, sources
 
@@ -69,13 +71,39 @@ ALIASES = {
 }
 
 
-def ask(question):
-    """Answer from the latest archived numbers only. No model, no guessing."""
-    data = archive.latest()
-    if not data:
-        return "No archived briefing yet. Call /run first."
-    q = (question or "").lower()
-    keys = [k for k, words in ALIASES.items() if any(w in q for w in words)] or list(ALIASES)
+DECLINE_LINE = 'I don\'t do "why", "will" or "should". Here is what I have:'
+
+# Questions asking for a reason, a forecast or advice. Matched as whole words.
+OPINION_WORDS = ("why", "will", "should", "predict", "prediction", "reason",
+                 "forecast", "expect", "tomorrow", "next week", "going to", "buy", "sell",
+                 "hold", "advice", "advise", "recommend", "opinion", "think", "worth", "cause",
+                 "caused")
+WEEK_WORDS = ("this week", "past week", "last week", "week", "7 days", "seven days", "daily")
+
+_declined_lock = threading.Lock()
+
+
+def _has(q, words):
+    return any(re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", q) for w in words)
+
+
+def is_opinion(question):
+    return _has((question or "").lower(), OPINION_WORDS)
+
+
+def wants_week(question):
+    return _has((question or "").lower(), WEEK_WORDS)
+
+
+def _keys(q):
+    return [k for k, words in ALIASES.items() if any(w in q for w in words)] or list(ALIASES)
+
+
+def _fmt(key, v):
+    return "{:,.2f}{}".format(v, "%" if key == "us10y" else "")
+
+
+def _latest_lines(data, keys):
     out = []
     for item in data["quotes"]:
         if item["key"] not in keys:
@@ -99,4 +127,63 @@ def ask(question):
         if item.get("check"):
             s += " [{}]".format(item["check"])
         out.append(s + ". Source: {}.".format(item["source"]))
+    return out
+
+
+def _week_lines(days, keys):
+    """Stored daily values of the last 7 days, per indicator, from every archived brief."""
+    series, labels = {}, {}
+    for data in days:  # oldest first, so a later brief wins on the same date
+        for item in data.get("quotes", []):
+            if item["key"] not in keys or item.get("error"):
+                continue
+            labels[item["key"]] = item["label"]
+            pts = series.setdefault(item["key"], {})
+            for d, v in ((item.get("prev_date"), item.get("prev_value")),
+                         (item.get("date"), item.get("value"))):
+                if d and v is not None:
+                    pts[d] = v
+    out = []
+    for key in ALIASES:
+        if key not in keys:
+            continue
+        pts = series.get(key)
+        if not pts:
+            out.append("{}: nothing stored this week.".format(labels.get(key, key)))
+            continue
+        last = dt.date.fromisoformat(max(pts))
+        start = (last - dt.timedelta(days=6)).isoformat()
+        row = ["{} {}".format(d[5:].replace("-", "/"), _fmt(key, pts[d]))
+               for d in sorted(pts) if d >= start]
+        out.append("{} this week: {}.".format(labels[key], ", ".join(row)))
+    out.append("Stored daily values from {} archived brief(s); dates are the source's own "
+               "session dates (BTC: UTC close).".format(len(days)))
+    return out
+
+
+def ask(question, dry_run=False):
+    """Answer from the archived numbers only. No model, no guessing.
+    Why / will / should questions are declined in one fixed line, logged to
+    archive/declined.md (committed to GitHub), and answered with the numbers."""
+    q = (question or "").lower()
+    keys = _keys(q)
+    opinion = is_opinion(q)
+    out = []
+    rec = None
+    if opinion:
+        out.append(DECLINE_LINE)
+        with _declined_lock:
+            rec = archive.record_declined(question, dry_run=dry_run)
+    data = archive.latest()
+    if not data:
+        out.append("No archived briefing yet. Call /run first.")
+    elif wants_week(q):
+        out += _week_lines(archive.all_days(), keys)
+    else:
+        out += _latest_lines(data, keys)
+    if rec is not None:
+        tail = "Declined so far: {}.".format(rec["count"])
+        if not rec.get("recorded"):
+            tail += " (not recorded: {})".format(rec.get("reason"))
+        out.append(tail)
     return "\n".join(out)
