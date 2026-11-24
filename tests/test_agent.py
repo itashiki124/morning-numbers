@@ -313,12 +313,37 @@ class Decline(unittest.TestCase):
 
     def test_daily_cap(self):
         now = dt.datetime(2026, 11, 24, 6, 0)
-        for i in range(archive.DECLINED_PER_DAY):
+        for i in range(archive.DECLINED_CAP["owner"]):
             self.assertTrue(archive.record_declined("why %d" % i, now=now)["recorded"])
         r = archive.record_declined("why again", now=now)
         self.assertFalse(r["recorded"])
         self.assertEqual(r["reason"], "daily cap reached")
         self.assertTrue(archive.record_declined("why", now=now + dt.timedelta(days=1))["recorded"])
+
+    def test_public_and_owner_caps_are_separate(self):
+        now = dt.datetime(2026, 11, 24, 6, 0)
+        for i in range(archive.DECLINED_CAP["public"]):
+            self.assertTrue(archive.record_declined("why %d" % i, now=now, public=True,
+                                                    matched=["why"], metrics=["VIX"])["recorded"])
+        self.assertFalse(archive.record_declined("why", now=now, public=True,
+                                                 matched=["why"])["recorded"])
+        # strangers used up their share; the owner's demo still gets logged
+        self.assertTrue(archive.record_declined("why did VIX fall?", now=now)["recorded"])
+        a = pipeline.ask("should I buy bitcoin?", public=True)
+        self.assertIn("not recorded: daily cap reached", a)
+        self.assertTrue(a.startswith(pipeline.DECLINE_LINE))
+
+    def test_public_log_keeps_no_typed_text(self):
+        a = pipeline.ask("Should I buy Bitcoin, my email is a@b.c", public=True)
+        self.assertTrue(a.startswith(pipeline.DECLINE_LINE))
+        with open(os.path.join(archive.ROOT, "declined.md")) as f:
+            body = f.read()
+        self.assertIn("(public) should/buy + BTC-USD", body)
+        self.assertNotIn("email", body)
+        self.assertNotIn("Bitcoin", body)
+        put = [c for c in self.calls if c[0] == "PUT"][0]
+        self.assertEqual(put[2]["message"], "declined: (public) should/buy + BTC-USD")
+        self.assertNotIn("email", json.dumps(put[2]))
 
     def test_github_failure_still_answers(self):
         def boom(*a, **k):
@@ -338,6 +363,171 @@ class Decline(unittest.TestCase):
         a = pipeline.ask("will btc rise this week?")
         self.assertTrue(a.startswith(pipeline.DECLINE_LINE))
         self.assertIn("BTC-USD this week: 11/22 61,163.01, 11/23 61,189.97.", a)
+
+
+class Jev(unittest.TestCase):
+    """Jev is a second judge: only a probability, used only when the word list lets a
+    question through, and the answer never contains generated text."""
+
+    def setUp(self):
+        self.saved = archive.ROOT, archive._gh, pipeline._jev_post
+        self.tmp = tempfile.TemporaryDirectory()
+        archive.ROOT = self.tmp.name
+        archive._gh = lambda m, url, body=None: (404, {}, "HTTP 404") if m == "GET" else (201, {}, None)
+        archive.write_local("2026-11-24", "x", [
+            q2("btc", "BTC-USD", "2026-11-23", 61189.97, "2026-11-22", 61163.01)],
+            us_session="2026-11-23")
+        self.sent = []
+
+    def tearDown(self):
+        archive.ROOT, archive._gh, pipeline._jev_post = self.saved
+        for k in ("TYPESAFE_GATEWAY_URL", "JEV", "GITHUB_GATEWAY_URL", "GITHUB_REPO"):
+            os.environ.pop(k, None)
+        self.tmp.cleanup()
+
+    def fake(self, p):
+        def post(url, body):
+            self.sent.append((url, body))
+            return {"model": "jev-1.14.0", "answers": {"opinion": {"type": "noul", "noul": p}}}
+        pipeline._jev_post = post
+
+    def test_off_without_key_word_list_only(self):
+        self.fake(0.99)
+        a = pipeline.ask("is now a good time to get into bitcoin?")
+        self.assertNotIn(pipeline.DECLINE_LINE, a)
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(pipeline.jev_judge("anything"))
+
+    def test_catches_what_the_words_miss(self):
+        os.environ["TYPESAFE_GATEWAY_URL"] = "https://api.sprites.dev/v1/gateway/typesafe/x/"
+        self.fake(0.97)
+        a = pipeline.ask("is now a good time to get into bitcoin?", public=True)
+        lines = a.splitlines()
+        self.assertEqual(lines[0], pipeline.DECLINE_LINE)
+        self.assertEqual(lines[1], "Declined (Jev: opinion-seeking, p=0.97).")
+        self.assertIn("BTC-USD was 61,189.97", a)
+        url, body = self.sent[0]
+        self.assertEqual(url, "https://api.sprites.dev/v1/gateway/typesafe/x/v1/systemone")
+        self.assertEqual(body["questions"]["opinion"]["type"], "noul")
+        with open(os.path.join(archive.ROOT, "declined.md")) as f:
+            self.assertIn("(public) Jev 0.97 + BTC-USD", f.read())
+
+    def test_low_probability_answers_normally(self):
+        os.environ["TYPESAFE_GATEWAY_URL"] = "https://gw.invalid"
+        self.fake(0.12)
+        a = pipeline.ask("what was bitcoin yesterday?")
+        self.assertNotIn(pipeline.DECLINE_LINE, a)
+        self.assertIn("BTC-USD was", a)
+
+    def test_word_list_first_no_jev_call(self):
+        os.environ["TYPESAFE_GATEWAY_URL"] = "https://gw.invalid"
+        self.fake(0.01)
+        a = pipeline.ask("why did bitcoin rise?", dry_run=True)
+        self.assertTrue(a.startswith(pipeline.DECLINE_LINE))
+        self.assertEqual(self.sent, [])
+
+    def test_jev_down_or_odd_shape_falls_back(self):
+        os.environ["TYPESAFE_GATEWAY_URL"] = "https://gw.invalid"
+
+        def boom(url, body):
+            raise OSError("down")
+        pipeline._jev_post = boom
+        self.assertIsNone(pipeline.jev_judge("good time for bitcoin?"))
+        pipeline._jev_post = lambda u, b: {"answers": {}}
+        self.assertIsNone(pipeline.jev_judge("good time for bitcoin?"))
+        os.environ["JEV"] = "0"
+        self.fake(0.99)
+        self.assertIsNone(pipeline.jev_judge("good time for bitcoin?"))
+
+
+class Server(unittest.TestCase):
+    """Run key required, 429 on floods, a page that shows no environment."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        import server
+        cls.server_mod = server
+        cls.saved = archive.ROOT, archive._gh
+        cls.tmp = tempfile.TemporaryDirectory()
+        archive.ROOT = cls.tmp.name
+        archive._gh = lambda m, url, body=None: (404, {}, "HTTP 404") if m == "GET" else (201, {}, None)
+        archive.write_local("2026-11-24", "VIX 26.62 <b>", [
+            q2("vix", "VIX", "2026-11-23", 26.62, "2026-11-20", 35.89)], us_session="2026-11-23")
+        os.environ.update(RUN_KEY="k" * 32, GITHUB_GATEWAY_URL="https://gw.invalid/SECRETPATH",
+                          GITHUB_REPO="o/r", DRY_RUN="1")
+        from http.server import ThreadingHTTPServer
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        archive.ROOT, archive._gh = cls.saved
+        for k in ("RUN_KEY", "GITHUB_GATEWAY_URL", "GITHUB_REPO", "DRY_RUN"):
+            os.environ.pop(k, None)
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.server_mod.LIMIT = self.server_mod.RateLimit(total=30, per_client=8)
+        self.saved_run = pipeline.run
+        pipeline.run = lambda dry_run=False, force=False: {"dry_run": dry_run, "force": force}
+
+    def tearDown(self):
+        pipeline.run = self.saved_run
+
+    def get(self, path, key=None):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path),
+                                     headers={"X-Run-Key": key} if key else {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_run_needs_key_even_dry(self):
+        self.assertEqual(self.get("/run?dry=1")[0], 403)
+        self.assertEqual(self.get("/run?dry=1", key="wrong")[0], 403)
+        st, body = self.get("/run?dry=1", key="k" * 32)
+        self.assertEqual(st, 200)
+        self.assertTrue(json.loads(body)["dry_run"])
+
+    def test_run_fails_closed_without_run_key(self):
+        saved = os.environ.pop("RUN_KEY")
+        try:
+            self.assertEqual(self.get("/run?dry=1", key="")[0], 403)
+            self.assertFalse(self.server_mod.key_ok(""))
+        finally:
+            os.environ["RUN_KEY"] = saved
+
+    def test_page_shows_brief_and_no_env(self):
+        st, body = self.get("/")
+        self.assertEqual(st, 200)
+        self.assertIn("The uncle with no opinions", body)
+        self.assertIn("No generated words. No guesses.", body)
+        self.assertIn("Declined so far:", body)
+        self.assertIn("VIX 26.62 &lt;b&gt;", body)
+        for secret in ("SECRETPATH", "k" * 32, "gw.invalid", "RUN_KEY"):
+            self.assertNotIn(secret, body)
+
+    def test_flood_gets_429_owner_not_limited(self):
+        self.server_mod.LIMIT = self.server_mod.RateLimit(total=30, per_client=3)
+        codes = [self.get("/ask?q=vix")[0] for _ in range(5)]
+        self.assertEqual(codes, [200, 200, 200, 429, 429])
+        self.assertEqual(self.get("/ask?q=vix", key="k" * 32)[0], 200)
+        self.assertEqual(self.get("/healthz")[0], 200)
+
+    def test_rate_limit_window(self):
+        t = [0.0]
+        rl = self.server_mod.RateLimit(total=2, per_client=5, clock=lambda: t[0])
+        self.assertTrue(rl.allow("a"))
+        self.assertTrue(rl.allow("b"))
+        self.assertFalse(rl.allow("c"))
+        t[0] = 61.0
+        self.assertTrue(rl.allow("c"))
 
 
 if __name__ == "__main__":
