@@ -1,4 +1,4 @@
-# Morning Numbers — no model. No guesses.
+# Morning Numbers — No model. No guesses.
 
 An agent with no model and no opinions, built for Fly.io Hacksgiving (Nov 23–29, 2026).
 
