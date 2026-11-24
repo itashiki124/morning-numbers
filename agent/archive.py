@@ -11,6 +11,9 @@ GITHUB_REPO are set, or when dry_run is on.
 Dry runs never write here. Production runs also leave state/YYYY-MM-DD.json
 (local only, not pushed) so a second /run on the same JST day sends nothing
 unless forced.
+
+archive/declined.md lists the questions /ask declined (why / will / should ...),
+one line each, and is committed through the same connector.
 """
 import base64
 import datetime as dt
@@ -60,28 +63,88 @@ def _gh(method, url, body=None):
         return None, {}, "%s: %s" % (type(e).__name__, e)
 
 
-def push_github(run_date, dry_run=False):
+def _put_file(rel, local_path, message, dry_run=False):
+    """Write one repo file through the GitHub Connector (Contents API)."""
     gw = os.environ.get("GITHUB_GATEWAY_URL", "").rstrip("/")
     repo = os.environ.get("GITHUB_REPO", "")
-    md, _ = paths(run_date)
-    rel = "archive/{}.md".format(run_date)
     if not gw or not repo:
         return {"pushed": False, "reason": "not configured", "path": rel}
     url = "{}/repos/{}/contents/{}".format(gw, repo, rel)
     if dry_run:
         return {"pushed": False, "reason": "dry-run", "method": "PUT", "url": url, "path": rel}
-    with open(md, "rb") as f:
+    with open(local_path, "rb") as f:
         content = base64.b64encode(f.read()).decode()
-    body = {"message": "brief {}".format(run_date), "content": content}
+    body = {"message": message, "content": content}
     status, existing, err = _gh("GET", url)
     if status is None:
         return {"pushed": False, "status": None, "reason": err, "path": rel}
     if status == 200 and existing.get("sha"):
-        body["sha"] = existing["sha"]  # update the file for today
+        body["sha"] = existing["sha"]  # update the existing file
     status, _, err = _gh("PUT", url, body)
     out = {"pushed": status in (200, 201), "status": status, "path": rel}
     if err:
         out["reason"] = err
+    return out
+
+
+def push_github(run_date, dry_run=False):
+    md, _ = paths(run_date)
+    return _put_file("archive/{}.md".format(run_date), md, "brief {}".format(run_date),
+                     dry_run=dry_run)
+
+
+DECLINED = "declined.md"
+DECLINED_PER_DAY = 20
+DECLINED_MAX_CHARS = 80
+
+
+def clean_question(q):
+    """ASCII letters, digits, spaces and light punctuation only; 80 chars max."""
+    kept = "".join(c for c in (q or "") if c.isascii() and (c.isalnum() or c in " ?!.,'&%-/"))
+    return " ".join(kept.split())[:DECLINED_MAX_CHARS]
+
+
+def declined_lines():
+    p = os.path.join(ROOT, DECLINED)
+    if not os.path.exists(p):
+        return []
+    with open(p, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l.startswith("- ")]
+
+
+def record_declined(question, dry_run=False, now=None):
+    """Append one declined question to archive/declined.md and commit it to GitHub.
+    Returns the record; never raises. Dry runs and the daily cap write nothing."""
+    now = now or dt.datetime.utcnow()
+    text = clean_question(question) or "(empty)"
+    lines = declined_lines()
+    out = {"question": text, "count": len(lines)}
+    if dry_run:
+        out.update(recorded=False, reason="dry-run", github={"pushed": False, "reason": "dry-run"})
+        return out
+    today = now.strftime("%Y-%m-%d")
+    if sum(1 for l in lines if l[2:12] == today) >= DECLINED_PER_DAY:
+        out.update(recorded=False, reason="daily cap reached",
+                   github={"pushed": False, "reason": "daily cap reached"})
+        return out
+    p = os.path.join(ROOT, DECLINED)
+    try:
+        os.makedirs(ROOT, exist_ok=True)
+        new = not os.path.exists(p)
+        with open(p, "a", encoding="utf-8") as f:
+            if new:
+                f.write("# Questions Morning Numbers declined\n\n"
+                        "It reports stored numbers. It does not explain, predict or advise.\n\n")
+            f.write("- {}  {}\n".format(now.strftime("%Y-%m-%dT%H:%M:%SZ"), text))
+    except OSError as e:
+        out.update(recorded=False, reason="%s: %s" % (type(e).__name__, e),
+                   github={"pushed": False, "reason": "local write failed"})
+        return out
+    out.update(recorded=True, count=len(lines) + 1)
+    try:
+        out["github"] = _put_file("archive/" + DECLINED, p, "declined: " + text)
+    except Exception as e:  # noqa: BLE001 - the answer must still go out
+        out["github"] = {"pushed": False, "reason": "%s: %s" % (type(e).__name__, e)}
     return out
 
 
@@ -119,9 +182,27 @@ def latest(before=None):
     """Latest archived day (optionally strictly before an ISO date)."""
     if not os.path.isdir(ROOT):
         return None
-    days = sorted(f for f in os.listdir(ROOT) if f.endswith(".json")
-                  and (before is None or f[:-5] < before))
+    days = _days(before)
     if not days:
         return None
     with open(os.path.join(ROOT, days[-1]), encoding="utf-8") as f:
         return json.load(f)
+
+
+def _days(before=None):
+    return sorted(f for f in os.listdir(ROOT) if f.endswith(".json") and len(f) == 15
+                  and (before is None or f[:-5] < before))
+
+
+def all_days():
+    """Every archived day's JSON, oldest first."""
+    if not os.path.isdir(ROOT):
+        return []
+    out = []
+    for name in _days():
+        try:
+            with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    return out
