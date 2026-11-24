@@ -94,14 +94,25 @@ def push_github(run_date, dry_run=False):
 
 
 DECLINED = "declined.md"
-DECLINED_PER_DAY = 20
 DECLINED_MAX_CHARS = 80
+# Separate daily caps so strangers on the public page cannot use up the owner's quota.
+DECLINED_CAP = {"public": 15, "owner": 10}
+DECLINED_PER_DAY = DECLINED_CAP["owner"]
+PUBLIC_TAG = "(public) "
 
 
 def clean_question(q):
     """ASCII letters, digits, spaces and light punctuation only; 80 chars max."""
     kept = "".join(c for c in (q or "") if c.isascii() and (c.isalnum() or c in " ?!.,'&%-/"))
     return " ".join(kept.split())[:DECLINED_MAX_CHARS]
+
+
+def public_summary(matched, metrics):
+    """The fixed form a public refusal is logged as: matched words + indicators only.
+    The typed text itself is never stored or committed."""
+    words = [clean_question(w) for w in (matched or []) if clean_question(w)][:3] or ["opinion"]
+    mets = [clean_question(m) for m in (metrics or []) if clean_question(m)][:4] or ["all"]
+    return "{} + {}".format("/".join(words), ", ".join(mets))[:DECLINED_MAX_CHARS]
 
 
 def declined_lines():
@@ -112,40 +123,69 @@ def declined_lines():
         return [l for l in f.read().splitlines() if l.startswith("- ")]
 
 
-def record_declined(question, dry_run=False, now=None):
+def _source(line):
+    parts = line.split("  ", 1)
+    return "public" if len(parts) == 2 and parts[1].startswith(PUBLIC_TAG) else "owner"
+
+
+def record_declined(question, dry_run=False, now=None, public=False, matched=None, metrics=None):
     """Append one declined question to archive/declined.md and commit it to GitHub.
-    Returns the record; never raises. Dry runs and the daily cap write nothing."""
+    public=True (the open web page): only "matched words + indicators" is written, never
+    the typed text. Owner calls (with the run key) may keep the cleaned question.
+    Returns the record; never raises. Dry runs and the daily caps write nothing."""
     now = now or dt.datetime.utcnow()
-    text = clean_question(question) or "(empty)"
+    source = "public" if public else "owner"
+    text = public_summary(matched, metrics) if public else (clean_question(question) or "(empty)")
     lines = declined_lines()
-    out = {"question": text, "count": len(lines)}
+    out = {"question": text, "count": len(lines), "source": source}
     if dry_run:
         out.update(recorded=False, reason="dry-run", github={"pushed": False, "reason": "dry-run"})
         return out
     today = now.strftime("%Y-%m-%d")
-    if sum(1 for l in lines if l[2:12] == today) >= DECLINED_PER_DAY:
+    used = sum(1 for l in lines if l[2:12] == today and _source(l) == source)
+    if used >= DECLINED_CAP[source]:
         out.update(recorded=False, reason="daily cap reached",
                    github={"pushed": False, "reason": "daily cap reached"})
         return out
     p = os.path.join(ROOT, DECLINED)
+    entry = (PUBLIC_TAG if public else "") + text
     try:
         os.makedirs(ROOT, exist_ok=True)
         new = not os.path.exists(p)
         with open(p, "a", encoding="utf-8") as f:
             if new:
                 f.write("# Questions Morning Numbers declined\n\n"
-                        "It reports stored numbers. It does not explain, predict or advise.\n\n")
-            f.write("- {}  {}\n".format(now.strftime("%Y-%m-%dT%H:%M:%SZ"), text))
+                        "It reports stored numbers. It does not explain, predict or advise.\n"
+                        "Lines marked (public) came from the open page and keep only the "
+                        "matched words and indicators, not what was typed.\n\n")
+            f.write("- {}  {}\n".format(now.strftime("%Y-%m-%dT%H:%M:%SZ"), entry))
     except OSError as e:
         out.update(recorded=False, reason="%s: %s" % (type(e).__name__, e),
                    github={"pushed": False, "reason": "local write failed"})
         return out
     out.update(recorded=True, count=len(lines) + 1)
     try:
-        out["github"] = _put_file("archive/" + DECLINED, p, "declined: " + text)
+        out["github"] = _put_file("archive/" + DECLINED, p, "declined: " + entry)
     except Exception as e:  # noqa: BLE001 - the answer must still go out
         out["github"] = {"pushed": False, "reason": "%s: %s" % (type(e).__name__, e)}
     return out
+
+
+def declined_count():
+    return len(declined_lines())
+
+
+def latest_brief_text():
+    """The text of the latest archived brief (last run block of the newest .md), or None."""
+    if not os.path.isdir(ROOT):
+        return None
+    mds = sorted(f for f in os.listdir(ROOT) if f.endswith(".md") and len(f) == 13)
+    if not mds:
+        return None
+    with open(os.path.join(ROOT, mds[-1]), encoding="utf-8") as f:
+        body = f.read()
+    parts = body.split("```")
+    return parts[-2].strip("\n") if len(parts) >= 3 else None
 
 
 def record_delivery(run_date, delivery):
