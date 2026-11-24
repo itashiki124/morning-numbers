@@ -3,7 +3,9 @@
   POST /run            fetch -> brief -> Pushover -> archive (GET also accepted)
                        at most once per JST day; /run?force=1 sends again
   GET  /run?dry=1      fetch + brief only: nothing is sent, pushed or archived
-  GET  /ask?q=...      explain the latest day-over-day moves from the archive
+  GET  /ask?q=...      the archived numbers only; "this week" lists stored daily values.
+                       why / will / should questions are declined in one fixed line,
+                       logged to archive/declined.md and committed (?dry=1: not logged)
   GET  /healthz        liveness
 
 Keep the Sprite URL on the default token auth (`sprite url update --auth sprite`)
@@ -55,7 +57,9 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 _lock.release()
         if u.path == "/ask":
-            return self._send(200, pipeline.ask(qs.get("q", [""])[0]) + "\n", "text/plain")
+            dry = qs.get("dry", ["0"])[0] in ("1", "true") or os.environ.get("DRY_RUN") == "1"
+            return self._send(200, pipeline.ask(qs.get("q", [""])[0], dry_run=dry) + "\n",
+                              "text/plain")
         return self._send(404, {"error": "not found", "routes": ["/run", "/ask?q=", "/healthz"]})
 
     do_GET = _route
