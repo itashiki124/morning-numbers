@@ -249,5 +249,96 @@ class NetworkErrors(unittest.TestCase):
         self.assertIn("timed out", r["reason"])
 
 
+class Decline(unittest.TestCase):
+    """/ask declines why / will / should, logs it, and still returns the numbers."""
+
+    def setUp(self):
+        self.saved = archive.ROOT, archive._gh
+        self.tmp = tempfile.TemporaryDirectory()
+        archive.ROOT = self.tmp.name
+        self.calls = []
+        archive._gh = lambda m, url, body=None: self.calls.append((m, url, body)) or (
+            (404, {}, "HTTP 404") if m == "GET" else (201, {}, None))
+        os.environ.update(GITHUB_GATEWAY_URL="https://gw.invalid", GITHUB_REPO="o/r")
+        archive.write_local("2026-11-23", "x", fake_quotes()[:1], us_session="2026-11-20")
+        archive.write_local("2026-11-24", "x", [
+            q2("vix", "VIX", "2026-11-23", 26.62, "2026-11-20", 35.89),
+            q2("btc", "BTC-USD", "2026-11-23", 61189.97, "2026-11-22", 61163.01)],
+            us_session="2026-11-23")
+
+    def tearDown(self):
+        archive.ROOT, archive._gh = self.saved
+        del os.environ["GITHUB_GATEWAY_URL"], os.environ["GITHUB_REPO"]
+        self.tmp.cleanup()
+
+    def test_opinion_detection(self):
+        for q in ("why did VIX fall?", "should I buy bitcoin?",
+                  "what will the S&P do tomorrow?", "Is BTC worth it"):
+            self.assertTrue(pipeline.is_opinion(q), q)
+        for q in ("vix", "what happened to the vix?", "btc this week", "show me willow"):
+            self.assertFalse(pipeline.is_opinion(q), q)
+
+    def test_decline_then_numbers_and_commit(self):
+        a = pipeline.ask("why did VIX fall?")
+        lines = a.splitlines()
+        self.assertEqual(lines[0], pipeline.DECLINE_LINE)
+        self.assertIn("VIX was 26.62 on 2026-11-23, down from 35.89", lines[1])
+        self.assertEqual(lines[-1], "Declined so far: 1.")
+        with open(os.path.join(archive.ROOT, "declined.md")) as f:
+            self.assertIn("why did VIX fall?", f.read())
+        put = [c for c in self.calls if c[0] == "PUT"][0]
+        self.assertTrue(put[1].endswith("/repos/o/r/contents/archive/declined.md"))
+        self.assertEqual(put[2]["message"], "declined: why did VIX fall?")
+        self.assertIn("Declined so far: 2.", pipeline.ask("should I buy bitcoin?"))
+
+    def test_plain_question_unchanged(self):
+        a = pipeline.ask("what happened to the vix?")
+        self.assertNotIn(pipeline.DECLINE_LINE, a)
+        self.assertNotIn("Declined", a)
+        self.assertFalse(os.path.exists(os.path.join(archive.ROOT, "declined.md")))
+        self.assertEqual(self.calls, [])
+
+    def test_dry_run_declines_without_logging(self):
+        a = pipeline.ask("why did VIX fall?", dry_run=True)
+        self.assertTrue(a.startswith(pipeline.DECLINE_LINE))
+        self.assertIn("not recorded: dry-run", a)
+        self.assertFalse(os.path.exists(os.path.join(archive.ROOT, "declined.md")))
+        self.assertEqual(self.calls, [])
+
+    def test_clean_and_truncate(self):
+        q = archive.clean_question("why??? <script>alert(1)</script> " + "x" * 200 + " \u65e5\u672c")
+        self.assertLessEqual(len(q), archive.DECLINED_MAX_CHARS)
+        self.assertNotIn("<", q)
+        self.assertTrue(q.isascii())
+
+    def test_daily_cap(self):
+        now = dt.datetime(2026, 11, 24, 6, 0)
+        for i in range(archive.DECLINED_PER_DAY):
+            self.assertTrue(archive.record_declined("why %d" % i, now=now)["recorded"])
+        r = archive.record_declined("why again", now=now)
+        self.assertFalse(r["recorded"])
+        self.assertEqual(r["reason"], "daily cap reached")
+        self.assertTrue(archive.record_declined("why", now=now + dt.timedelta(days=1))["recorded"])
+
+    def test_github_failure_still_answers(self):
+        def boom(*a, **k):
+            raise RuntimeError("gateway down")
+        archive._gh = boom
+        a = pipeline.ask("why did VIX fall?")
+        self.assertIn("VIX was 26.62", a)
+        self.assertIn("Declined so far: 1.", a)
+
+    def test_this_week_lists_stored_days(self):
+        a = pipeline.ask("vix this week")
+        self.assertIn("VIX this week: 11/19 28.44, 11/20 35.89, 11/23 26.62.", a)
+        self.assertIn("2 archived brief(s)", a)
+        self.assertNotIn("BTC", a.splitlines()[0])
+
+    def test_this_week_with_opinion(self):
+        a = pipeline.ask("will btc rise this week?")
+        self.assertTrue(a.startswith(pipeline.DECLINE_LINE))
+        self.assertIn("BTC-USD this week: 11/22 61,163.01, 11/23 61,189.97.", a)
+
+
 if __name__ == "__main__":
     unittest.main()
